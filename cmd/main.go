@@ -4,9 +4,9 @@ import (
 	"fmt"
 	"log"
 	"net/http"
-	"net/url"
 	"os"
-	"strconv"
+	"strings"
+	"sync"
 
 	"github.com/spf13/cobra"
 	corev1 "k8s.io/api/core/v1"
@@ -21,6 +21,16 @@ import (
 	"k8s.io/client-go/tools/portforward"
 	"k8s.io/client-go/transport/spdy"
 )
+
+type id string
+
+func (i id) podName() string {
+	return strings.Split(string(i), "/")[0]
+}
+
+func (i id) port() string {
+	return strings.Split(string(i), ":")[1]
+}
 
 func main() {
 	overrides := &clientcmd.ConfigOverrides{}
@@ -50,58 +60,110 @@ func main() {
 				log.Fatalf("failed to create Kubernetes clientset: %v\n", err)
 			}
 			factory := informers.NewSharedInformerFactoryWithOptions(clientset, 0, informers.WithNamespace(namespace))
-			informer := factory.Core().V1().Pods().Informer()
 			stopChannel := make(chan struct{})
 			defer close(stopChannel)
 			defer runtime.HandleCrash()
-			startPortForward := func(url *url.URL, ports []string) error {
+
+			lock := sync.Mutex{}
+			forwards := make(map[id]*portforward.PortForwarder)
+
+			startPortForward := func(id id) error {
+				url := restClient.Post().Resource("pods").Namespace(namespace).Name(id.podName()).SubResource("portforward").URL()
 				transport, upgrader, err := spdy.RoundTripperFor(restConfig)
 				if err != nil {
 					return fmt.Errorf("failed to create SPDY round tripper: %w", err)
 				}
 				dialer := spdy.NewDialer(upgrader, &http.Client{Transport: transport}, "POST", url)
-				forwarder, err := portforward.New(dialer, ports, stopChannel, make(chan struct{}), os.Stdin, os.Stderr)
+				forwarder, err := portforward.New(dialer, []string{id.port()}, stopChannel, make(chan struct{}), os.Stdin, os.Stderr)
 				if err != nil {
 					return fmt.Errorf("failed to create port forwarder: %v", err)
 				}
-				for _, port := range ports {
-					log.Printf("forwarding http://localhost:%s", port)
+				lock.Lock()
+				for i, f := range forwards {
+					if i.port() == id.port() {
+						fmt.Printf("closing existing port-forward %v\n", i)
+						f.Close()
+					}
 				}
+				forwards[id] = forwarder
+				lock.Unlock()
+				defer func() {
+					lock.Lock()
+					defer lock.Unlock()
+					if forwards[id] == forwarder {
+						delete(forwards, id)
+					}
+				}()
+				fmt.Printf("%v on http://localhost:%v\n", id.podName(), id.port())
 				err = forwarder.ForwardPorts()
 				if err != nil {
 					return fmt.Errorf("failed to forward port: %v", err)
 				}
 				return nil
 			}
-			startPodPortForward := func(obj interface{}) {
-				pod, ok := obj.(*corev1.Pod)
-				if !ok {
-					return
-				}
-				log.Printf("detected pod/%s (%s)", pod.Name, pod.Status.Phase)
+
+			podAdded := func(obj interface{}) {
+				pod := obj.(*corev1.Pod)
 				if pod.Status.Phase != corev1.PodRunning {
 					return
 				}
 				for _, c := range pod.Spec.Containers {
 					for _, p := range c.Ports {
-						req := restClient.Post().Resource("pods").Namespace(namespace).Name(pod.Name).SubResource("portforward")
 						go func(p corev1.ContainerPort) {
-							log.Printf("starting port-forward to %s/%s/%s:%v...\n", "pod", pod.Name, c.Name, p.ContainerPort)
-							err := startPortForward(req.URL(), []string{strconv.Itoa(int(p.ContainerPort))})
+							err := startPortForward(id(fmt.Sprintf("%s/%s:%v", pod.Name, c.Name, p.ContainerPort)))
 							if err != nil {
-								log.Printf("failed to start port-forward: %v\n", err)
+								fmt.Printf("failed to start port-forward: %v\n", err)
 							}
 						}(p)
 					}
 				}
 			}
-			informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
-				AddFunc: startPodPortForward,
+
+			podDeleted := func(podName string) {
+				lock.Lock()
+				defer lock.Unlock()
+				var ids []id
+				for i, f := range forwards {
+					if i.podName() == podName {
+						f.Close()
+						delete(forwards, i)
+						ids = append(ids, i)
+					}
+				}
+				for _, j := range ids {
+					for i := range forwards {
+						if i.port() == j.port() {
+							go func() {
+								err := startPortForward(i)
+								if err != nil {
+									fmt.Printf("failed to start port-forward: %v\n", err)
+								}
+							}()
+							break
+						}
+					}
+				}
+			}
+
+			// pods
+			podInformer := factory.Core().V1().Pods().Informer()
+			podInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+				AddFunc: podAdded,
 				UpdateFunc: func(_, obj interface{}) {
-					startPodPortForward(obj)
+					pod, ok := obj.(*corev1.Pod)
+					if ok && pod.GetDeletionTimestamp() == nil {
+						podAdded(pod)
+					} else {
+						podDeleted(pod.Name)
+					}
+				},
+				DeleteFunc: func(obj interface{}) {
+					key, _ := cache.DeletionHandlingMetaNamespaceKeyFunc(obj)
+					_, name, _ := cache.SplitMetaNamespaceKey(key)
+					podDeleted(name)
 				},
 			})
-			go informer.Run(stopChannel)
+			go podInformer.Run(stopChannel)
 			<-stopChannel
 		},
 	}
