@@ -7,11 +7,11 @@ This tool listens for pod creation or deletion and sets up forwards automaticall
 Install:
 
 ```bash
-go install github.com/alexec/kubectl-auto-forward
+go install github.com/alexec/kubectl-autoforward
 ```
 
 Run:
 
 ```bash
-kubectl-auto-forward
+kubectl autoforward
 ```
