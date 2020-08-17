@@ -1,4 +1,4 @@
-module github.com/alexec/kubectl-auto-forward
+module github.com/alexec/kubectl-autoforward
 
 go 1.13
 

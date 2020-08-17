@@ -15,3 +15,7 @@ Run:
 ```bash
 kubectl autoforward
 ```
+
+## FAQ
+
+Why is it `autoforward` not `auto-forward`? Kubectl plugins must not have hyphens in their name.
